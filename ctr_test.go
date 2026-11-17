@@ -174,9 +174,12 @@ func TestZeroize(t *testing.T) {
 
 func TestNoAlloc(t *testing.T) {
 	c, _ := New(make([]byte, 32))
+	// The kernel allocates nothing; the crypto/cipher fallback (no kernel on
+	// this architecture) allocates its CTR state, at most twice.
+	limit := float64(2 * (1 - min(c.rounds, 1)))
 	buf := make([]byte, 4096)
 	var iv [16]byte
-	if n := testing.AllocsPerRun(100, func() { c.XORKeyStream(buf, buf, &iv) }); n != 0 {
+	if n := testing.AllocsPerRun(100, func() { c.XORKeyStream(buf, buf, &iv) }); n > limit {
 		t.Errorf("XORKeyStream allocates %v times per call", n)
 	}
 }
