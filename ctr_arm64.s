@@ -1,0 +1,177 @@
+//go:build arm64
+
+#include "textflag.h"
+
+// Register plan (NEON):
+//   V0-V14   the round keys, right-aligned: the last key is always V14, so
+//            AES-256 uses V0..V14, AES-192 V2..V14 and AES-128 V4..V14.
+//   V16-V23  the eight blocks in flight.
+//   V24      the counter, every 32-bit word byte-swapped to an integer; only
+//            word 3 (the low 32 bits of the big-endian counter) ever changes.
+//   V25      {0,0,0,1}.
+//   V26-V29  source blocks.
+
+// RND is one AES round (AESE+AESMC, adjacent so the core can fuse them) on
+// the eight blocks.
+#define RND(K) \
+	AESE	K.B16, V16.B16; AESMC	V16.B16, V16.B16; \
+	AESE	K.B16, V17.B16; AESMC	V17.B16, V17.B16; \
+	AESE	K.B16, V18.B16; AESMC	V18.B16, V18.B16; \
+	AESE	K.B16, V19.B16; AESMC	V19.B16, V19.B16; \
+	AESE	K.B16, V20.B16; AESMC	V20.B16, V20.B16; \
+	AESE	K.B16, V21.B16; AESMC	V21.B16, V21.B16; \
+	AESE	K.B16, V22.B16; AESMC	V22.B16, V22.B16; \
+	AESE	K.B16, V23.B16; AESMC	V23.B16, V23.B16
+
+// func ctrBlocksAsm(rk *byte, rounds int, iv *[16]byte, dst, src *byte, n int)
+//
+// XORs n whole blocks of src with the keystream AES(rk, iv + i), i = 0..n-1,
+// into dst. The caller guarantees that the low 32 bits of the big-endian
+// counter do not wrap inside the n blocks. dst and src are equal or disjoint.
+TEXT ·ctrBlocksAsm(SB), NOSPLIT, $0-48
+	MOVD	rk+0(FP), R0
+	MOVD	rounds+8(FP), R1
+	MOVD	iv+16(FP), R2
+	MOVD	dst+24(FP), R3
+	MOVD	src+32(FP), R4
+	MOVD	n+40(FP), R5
+
+	VLD1	(R2), [V24.B16]
+	VREV32	V24.B16, V24.B16
+	MOVD	$1, R6
+	VEOR	V25.B16, V25.B16, V25.B16
+	VMOV	R6, V25.S[3]
+
+	CMP	$12, R1
+	BLT	load128
+	BEQ	load192
+	VLD1.P	32(R0), [V0.B16, V1.B16]
+load192:
+	VLD1.P	32(R0), [V2.B16, V3.B16]
+load128:
+	VLD1.P	64(R0), [V4.B16, V5.B16, V6.B16, V7.B16]
+	VLD1.P	64(R0), [V8.B16, V9.B16, V10.B16, V11.B16]
+	VLD1.P	48(R0), [V12.B16, V13.B16, V14.B16]
+
+	CMP	$8, R5
+	BLT	tail
+
+loop8:
+	VREV32	V24.B16, V16.B16
+	VADD	V25.S4, V24.S4, V24.S4
+	VREV32	V24.B16, V17.B16
+	VADD	V25.S4, V24.S4, V24.S4
+	VREV32	V24.B16, V18.B16
+	VADD	V25.S4, V24.S4, V24.S4
+	VREV32	V24.B16, V19.B16
+	VADD	V25.S4, V24.S4, V24.S4
+	VREV32	V24.B16, V20.B16
+	VADD	V25.S4, V24.S4, V24.S4
+	VREV32	V24.B16, V21.B16
+	VADD	V25.S4, V24.S4, V24.S4
+	VREV32	V24.B16, V22.B16
+	VADD	V25.S4, V24.S4, V24.S4
+	VREV32	V24.B16, V23.B16
+	VADD	V25.S4, V24.S4, V24.S4
+
+	CMP	$12, R1
+	BLT	enc128
+	BEQ	enc192
+	RND(V0)
+	RND(V1)
+enc192:
+	RND(V2)
+	RND(V3)
+enc128:
+	RND(V4)
+	RND(V5)
+	RND(V6)
+	RND(V7)
+	RND(V8)
+	RND(V9)
+	RND(V10)
+	RND(V11)
+	RND(V12)
+	// Last round: AESE without MixColumns, then the final key.
+	AESE	V13.B16, V16.B16
+	AESE	V13.B16, V17.B16
+	AESE	V13.B16, V18.B16
+	AESE	V13.B16, V19.B16
+	AESE	V13.B16, V20.B16
+	AESE	V13.B16, V21.B16
+	AESE	V13.B16, V22.B16
+	AESE	V13.B16, V23.B16
+
+	// Fold the final round key into the source, then XOR in the keystream.
+	VLD1.P	64(R4), [V26.B16, V27.B16, V28.B16, V29.B16]
+	VEOR	V26.B16, V14.B16, V26.B16
+	VEOR	V27.B16, V14.B16, V27.B16
+	VEOR	V28.B16, V14.B16, V28.B16
+	VEOR	V29.B16, V14.B16, V29.B16
+	VEOR	V16.B16, V26.B16, V16.B16
+	VEOR	V17.B16, V27.B16, V17.B16
+	VEOR	V18.B16, V28.B16, V18.B16
+	VEOR	V19.B16, V29.B16, V19.B16
+	VLD1.P	64(R4), [V26.B16, V27.B16, V28.B16, V29.B16]
+	VEOR	V26.B16, V14.B16, V26.B16
+	VEOR	V27.B16, V14.B16, V27.B16
+	VEOR	V28.B16, V14.B16, V28.B16
+	VEOR	V29.B16, V14.B16, V29.B16
+	VEOR	V20.B16, V26.B16, V20.B16
+	VEOR	V21.B16, V27.B16, V21.B16
+	VEOR	V22.B16, V28.B16, V22.B16
+	VEOR	V23.B16, V29.B16, V23.B16
+	VST1.P	[V16.B16, V17.B16, V18.B16, V19.B16], 64(R3)
+	VST1.P	[V20.B16, V21.B16, V22.B16, V23.B16], 64(R3)
+
+	SUB	$8, R5
+	CMP	$8, R5
+	BGE	loop8
+
+tail:
+	CBZ	R5, done
+
+loop1:
+	VREV32	V24.B16, V16.B16
+	VADD	V25.S4, V24.S4, V24.S4
+	CMP	$12, R1
+	BLT	t128
+	BEQ	t192
+	AESE	V0.B16, V16.B16
+	AESMC	V16.B16, V16.B16
+	AESE	V1.B16, V16.B16
+	AESMC	V16.B16, V16.B16
+t192:
+	AESE	V2.B16, V16.B16
+	AESMC	V16.B16, V16.B16
+	AESE	V3.B16, V16.B16
+	AESMC	V16.B16, V16.B16
+t128:
+	AESE	V4.B16, V16.B16
+	AESMC	V16.B16, V16.B16
+	AESE	V5.B16, V16.B16
+	AESMC	V16.B16, V16.B16
+	AESE	V6.B16, V16.B16
+	AESMC	V16.B16, V16.B16
+	AESE	V7.B16, V16.B16
+	AESMC	V16.B16, V16.B16
+	AESE	V8.B16, V16.B16
+	AESMC	V16.B16, V16.B16
+	AESE	V9.B16, V16.B16
+	AESMC	V16.B16, V16.B16
+	AESE	V10.B16, V16.B16
+	AESMC	V16.B16, V16.B16
+	AESE	V11.B16, V16.B16
+	AESMC	V16.B16, V16.B16
+	AESE	V12.B16, V16.B16
+	AESMC	V16.B16, V16.B16
+	AESE	V13.B16, V16.B16
+	VLD1.P	16(R4), [V26.B16]
+	VEOR	V26.B16, V14.B16, V26.B16
+	VEOR	V16.B16, V26.B16, V16.B16
+	VST1.P	[V16.B16], 16(R3)
+	SUBS	$1, R5
+	BNE	loop1
+
+done:
+	RET
