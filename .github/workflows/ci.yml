@@ -108,6 +108,10 @@ jobs:
           ls -l _tbin
 
       - name: run test binaries under QEMU (${{ matrix.arch }})
+        env:
+          # These architectures have no kernel, so the kernel branch of
+          # XORKeyStream is unreachable there: the full gate is native.
+          COVER_MIN: "50.0"
         run: |
           set -euo pipefail
           fail=0
