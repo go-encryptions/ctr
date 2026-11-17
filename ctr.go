@@ -84,6 +84,13 @@ func (c *Cipher) XORKeyStream(dst, src []byte, iv *[BlockSize]byte) {
 		cipher.NewCTR(c.block, iv[:]).XORKeyStream(dst, src)
 		return
 	}
+	// The common case, a whole number of blocks whose counter does not cross
+	// a 2^32 boundary (a sector): one kernel call, iv used where it is.
+	if n := uint64(len(src) / BlockSize); len(src)%BlockSize == 0 &&
+		n <= 1<<32-uint64(binary.BigEndian.Uint32(iv[12:])) {
+		ctrBlocksAsm(&c.rk[0], c.rounds, iv, &dst[0], &src[0], int(n))
+		return
+	}
 	ctr := *iv
 	for len(src) >= BlockSize {
 		// The kernels add to the low 32 bits of the counter only, so a call
